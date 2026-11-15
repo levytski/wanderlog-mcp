@@ -307,15 +307,25 @@ export class ShareDBClient extends EventEmitter {
   }
 
   private handleOpFrame(frame: OpFrame): void {
-    const isOurAck =
-      frame.src === this.sessionId && frame.seq !== undefined && this.pendingOps.has(frame.seq);
+    // Ops we authored echo back with src === our session id. They must never
+    // travel the remoteOp path: we already applied them locally when we
+    // submitted, so replaying them would double-apply the mutation and create
+    // duplicate blocks. This matters even when no pending entry matches: a
+    // late ack arriving after the submit timeout, or a duplicate ack from a
+    // rate-limit retry, both echo our own src with a seq we've already cleared.
+    const isOurs = frame.src !== undefined && frame.src === this.sessionId;
 
-    if (isOurAck) {
-      const pending = this.pendingOps.get(frame.seq!)!;
-      this.pendingOps.delete(frame.seq!);
-      clearTimeout(pending.timer);
-      this._version = frame.v + 1;
-      pending.resolve();
+    if (isOurs) {
+      if (frame.seq !== undefined && this.pendingOps.has(frame.seq)) {
+        const pending = this.pendingOps.get(frame.seq)!;
+        this.pendingOps.delete(frame.seq);
+        clearTimeout(pending.timer);
+        this._version = frame.v + 1;
+        pending.resolve();
+      }
+      // Own op with no matching pending entry (late/duplicate ack): already
+      // applied and accounted for. Drop it without re-emitting or rewinding
+      // the version.
       return;
     }
 
